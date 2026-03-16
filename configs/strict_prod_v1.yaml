@@ -1,11 +1,20 @@
-# Quantbuild E1 — XAUUSD Base Profile
+# ============================================================
+# STRICT_PROD_V1 — Official production configuration
+# ============================================================
+# Data-validated on 5 years XAUUSD (2021-2026):
+#   - SKIP_COMP: skip compression, same 2:1 TP/SL for trend+expansion
+#   - R/DD ratio: 2.08 (vs 1.77 baseline)
+#   - Max DD: -25R (vs -35R baseline)
+#   - Fixed losing years: 2023 -2R -> +8R, 2024 -4R -> +1R
+# ============================================================
+
 symbol: XAUUSD
 timeframes:
   - 15m
   - 1h
 
 backtest:
-  default_period_days: 365
+  default_period_days: 1825
   tp_r: 2.0
   sl_r: 1.0
   session_filter: null
@@ -15,6 +24,7 @@ risk:
   max_position_pct: 0.015
   max_daily_loss_r: 2.5
   max_concurrent_positions: 3
+  max_trades_per_session: 3
   equity_kill_switch_pct: 10.0
   risk_pct_per_r: 0.01
 
@@ -71,6 +81,7 @@ regime:
   structure_lookback: 30
   structure_pivot_bars: 2
 
+# Core decision: regime = permission layer, not strategy switcher
 regime_profiles:
   trend:
     tp_r: 2.0
@@ -78,10 +89,10 @@ regime_profiles:
     max_trades_per_session: 3
     position_size_mult: 1.0
   expansion:
-    tp_r: 3.0
-    sl_r: 1.5
-    max_trades_per_session: 2
-    position_size_mult: 0.75
+    tp_r: 2.0
+    sl_r: 1.0
+    max_trades_per_session: 3
+    position_size_mult: 1.0
   compression:
     skip: true
     tp_r: 0
@@ -89,7 +100,7 @@ regime_profiles:
     max_trades_per_session: 0
     position_size_mult: 0
 
-# ---- News Layer (Fase 2+3) ----
+# ---- News Layer ----
 news:
   enabled: true
   poll_interval_seconds: 30
@@ -188,7 +199,7 @@ news:
     check_interval_seconds: 60
     exit_threshold: 0.8
 
-# ---- Broker (Fase 4) ----
+# ---- Broker ----
 broker:
   provider: oanda
   environment: practice
@@ -199,7 +210,7 @@ broker:
   leverage: 100
   margin_rate: 0.05
 
-# ---- Alerts (Fase 5) ----
+# ---- Alerts ----
 monitoring:
   telegram:
     enabled: false

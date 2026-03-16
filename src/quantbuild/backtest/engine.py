@@ -1,4 +1,11 @@
-"""Backtest engine: load data, run strategy, record trades."""
+"""Backtest engine: load data, run strategy, record trades.
+
+Supports:
+  - Regime-aware entry filtering (TREND/EXPANSION/COMPRESSION)
+  - Per-regime TP/SL/position-size profiles
+  - NewsGate integration (block around events, sentiment boost)
+  - NewsHistory replay for backtesting with historical news
+"""
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -82,33 +89,79 @@ def _simulate_trade(data: pd.DataFrame, i: int, direction: str, tp_r: float, sl_
     exit_ts = ts_arr[i]
     exit_price = entry_price
     result = "TIMEOUT"
+    max_favorable = 0.0
+    max_adverse = 0.0
 
     for j in range(i + 1, n):
         lo, hi = low_arr[j], high_arr[j]
+
         if direction == "LONG":
+            favorable = hi - entry_price
+            adverse = entry_price - lo
             if lo <= sl:
                 exit_price, result, exit_ts = sl, "LOSS", ts_arr[j]
+                max_adverse = max(max_adverse, adverse)
                 break
             if hi >= tp:
                 exit_price, result, exit_ts = tp, "WIN", ts_arr[j]
+                max_favorable = max(max_favorable, favorable)
                 break
         else:
+            favorable = entry_price - lo
+            adverse = hi - entry_price
             if hi >= sl:
                 exit_price, result, exit_ts = sl, "LOSS", ts_arr[j]
+                max_adverse = max(max_adverse, adverse)
                 break
             if lo <= tp:
                 exit_price, result, exit_ts = tp, "WIN", ts_arr[j]
+                max_favorable = max(max_favorable, favorable)
                 break
+
+        max_favorable = max(max_favorable, favorable)
+        max_adverse = max(max_adverse, adverse)
+
         if j == n - 1:
             exit_price, exit_ts, result = float(close_arr[j]), ts_arr[j], "TIMEOUT"
 
+    risk = abs(entry_price - sl)
+    mae_r = (max_adverse / risk) if risk else 0.0
+    mfe_r = (max_favorable / risk) if risk else 0.0
     profit_usd = (exit_price - entry_price) if direction == "LONG" else (entry_price - exit_price)
     profit_r = calculate_rr(entry_price, exit_price, sl, direction)
 
     return {
         "entry_price": entry_price, "exit_price": exit_price, "sl": sl, "tp": tp,
-        "exit_ts": exit_ts, "profit_usd": profit_usd, "profit_r": profit_r, "result": result, "atr": atr,
+        "exit_ts": exit_ts, "profit_usd": profit_usd, "profit_r": profit_r,
+        "result": result, "atr": atr, "mae_r": mae_r, "mfe_r": mfe_r,
     }
+
+
+def _setup_news_gate(cfg: Dict[str, Any]):
+    """Initialize NewsGate + NewsHistory for backtest if news is enabled."""
+    if not cfg.get("news", {}).get("enabled", False):
+        return None, None
+
+    try:
+        from src.quantbuild.strategy_modules.news_gate import NewsGate
+        from src.quantbuild.news.history import NewsHistory
+
+        gate = NewsGate(cfg)
+        history = NewsHistory()
+        loaded = history.load_from_parquet()
+        if loaded > 0:
+            logger.info("NewsGate active with %d historical events", loaded)
+            for ev in history.events:
+                sentiment = None
+                if ev.event_id in history._sentiments:
+                    sentiment = history._sentiments[ev.event_id]
+                gate.add_news_event(ev, sentiment)
+        else:
+            logger.info("NewsGate active but no historical news data (passthrough mode)")
+        return gate, history
+    except Exception as e:
+        logger.debug("NewsGate setup skipped: %s", e)
+        return None, None
 
 
 def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = None) -> List[Trade]:
@@ -126,6 +179,7 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
     risk_cfg = cfg.get("risk", {})
     max_daily_loss_r = risk_cfg.get("max_daily_loss_r", 3.0)
     equity_kill_switch_pct = risk_cfg.get("equity_kill_switch_pct", 10.0)
+    base_max_trades_per_session = risk_cfg.get("max_trades_per_session", 1)
 
     end = datetime.now()
     start = end - timedelta(days=period_days)
@@ -144,13 +198,15 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
 
     # Regime detection
     regime_series: Optional[pd.Series] = None
+    regime_profiles = cfg.get("regime_profiles", None)
     if precomputed_regime is not None:
         regime_series = precomputed_regime.reindex(data.index, method="ffill")
         data["regime"] = regime_series
     else:
         try:
             from src.quantbuild.strategy_modules.regime.detector import RegimeDetector
-            detector = RegimeDetector()
+            regime_cfg = cfg.get("regime", {})
+            detector = RegimeDetector(config=regime_cfg)
             data_1h = load_parquet(base_path, symbol, "1h", start=start, end=end)
             if not data_1h.empty:
                 data_1h = data_1h.sort_index()
@@ -158,6 +214,9 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
             data["regime"] = regime_series
         except (ImportError, Exception) as e:
             logger.debug("Regime detection skipped: %s", e)
+
+    # NewsGate setup (loads historical news if available)
+    news_gate, _news_history = _setup_news_gate(cfg)
 
     # Generate entry signals
     precomputed_df = _compute_modules_once(data, sqe_cfg)
@@ -186,13 +245,14 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
             entry_signals.append((i, "SHORT"))
 
     # Risk management state
-    max_trades_per_session = risk_cfg.get("max_trades_per_session", 1)
     traded_session_direction: Dict[Any, int] = {}
     daily_pnl_r: Dict[Any, float] = {}
     cumulative_r = 0.0
     peak_r = 0.0
     kill_switch_triggered = False
     trades: List[Trade] = []
+    regime_skip_count = 0
+    news_block_count = 0
 
     sim_cache = _prepare_sim_cache(data)
 
@@ -208,21 +268,43 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
             kill_switch_triggered = True
             break
 
-        session_key = (trade_date, session_from_timestamp(entry_ts, mode=session_mode), direction)
-        if traded_session_direction.get(session_key, 0) >= max_trades_per_session:
-            continue
-
+        # Regime-aware filtering
         current_regime = None
+        regime_profile: Dict[str, Any] = {}
         if regime_series is not None and i < len(regime_series):
             current_regime = regime_series.iloc[i]
+            if regime_profiles and current_regime is not None:
+                regime_key = current_regime.lower() if isinstance(current_regime, str) else str(current_regime)
+                regime_profile = regime_profiles.get(regime_key, {})
 
-        regime_cfg = cfg.get("regime_profiles", None)
-        trade_tp_r, trade_sl_r = tp_r, sl_r
-        if regime_cfg and current_regime is not None:
-            regime_profile = regime_cfg.get(current_regime.lower(), {}) if isinstance(current_regime, str) else {}
-            if regime_profile:
-                trade_tp_r = regime_profile.get("tp_r", tp_r)
-                trade_sl_r = regime_profile.get("sl_r", sl_r)
+        if regime_profile.get("skip", False):
+            regime_skip_count += 1
+            continue
+
+        # Per-regime max trades per session
+        max_tps = regime_profile.get("max_trades_per_session", base_max_trades_per_session)
+        session_key = (trade_date, session_from_timestamp(entry_ts, mode=session_mode), direction)
+        if traded_session_direction.get(session_key, 0) >= max_tps:
+            continue
+
+        # NewsGate check
+        news_boost = 1.0
+        news_sentiment_at_entry = None
+        if news_gate is not None:
+            gate_result = news_gate.check_gate(entry_ts, direction)
+            if not gate_result["allowed"]:
+                news_block_count += 1
+                continue
+            news_boost = gate_result.get("boost", 1.0)
+
+        if _news_history is not None:
+            sentiment_at = _news_history.get_sentiment_at(entry_ts)
+            if sentiment_at:
+                news_sentiment_at_entry = sentiment_at.get("direction")
+
+        # Regime-aware TP/SL
+        trade_tp_r = regime_profile.get("tp_r", tp_r)
+        trade_sl_r = regime_profile.get("sl_r", sl_r)
 
         result = _simulate_trade(data, i, direction, trade_tp_r, trade_sl_r, _cache=sim_cache)
 
@@ -239,6 +321,8 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
             profit_r=result["profit_r"],
             result=result["result"],
             regime=str(current_regime) if current_regime else None,
+            news_sentiment_at_entry=news_sentiment_at_entry,
+            news_boost_applied=news_boost if news_boost != 1.0 else None,
         )
         traded_session_direction[session_key] = traded_session_direction.get(session_key, 0) + 1
         trades.append(t)
@@ -251,6 +335,10 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
     logger.info("%s %s: %d trades (LONG: %d, SHORT: %d)", symbol, tf, len(trades),
                 sum(1 for t in trades if t.direction == "LONG"),
                 sum(1 for t in trades if t.direction == "SHORT"))
+    if regime_skip_count:
+        logger.info("Regime skipped: %d entries (COMPRESSION)", regime_skip_count)
+    if news_block_count:
+        logger.info("NewsGate blocked: %d entries", news_block_count)
 
     if trades:
         from src.quantbuild.backtest.metrics import compute_metrics

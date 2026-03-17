@@ -252,6 +252,7 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
     kill_switch_triggered = False
     trades: List[Trade] = []
     regime_skip_count = 0
+    regime_session_skip_count = 0
     news_block_count = 0
 
     sim_cache = _prepare_sim_cache(data)
@@ -281,9 +282,26 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
             regime_skip_count += 1
             continue
 
+        # Per-regime session + time-of-day filter
+        current_session = session_from_timestamp(entry_ts, mode=session_mode)
+        allowed_sessions = regime_profile.get("allowed_sessions")
+        if allowed_sessions and current_session not in allowed_sessions:
+            regime_session_skip_count += 1
+            continue
+
+        min_hour = regime_profile.get("min_hour_utc")
+        if min_hour is not None and entry_ts.hour < min_hour:
+            regime_session_skip_count += 1
+            continue
+
+        max_hour = regime_profile.get("max_hour_utc")
+        if max_hour is not None and entry_ts.hour >= max_hour:
+            regime_session_skip_count += 1
+            continue
+
         # Per-regime max trades per session
         max_tps = regime_profile.get("max_trades_per_session", base_max_trades_per_session)
-        session_key = (trade_date, session_from_timestamp(entry_ts, mode=session_mode), direction)
+        session_key = (trade_date, current_session, direction)
         if traded_session_direction.get(session_key, 0) >= max_tps:
             continue
 
@@ -321,6 +339,7 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
             profit_r=result["profit_r"],
             result=result["result"],
             regime=str(current_regime) if current_regime else None,
+            session=current_session,
             news_sentiment_at_entry=news_sentiment_at_entry,
             news_boost_applied=news_boost if news_boost != 1.0 else None,
         )
@@ -337,6 +356,8 @@ def run_backtest(cfg: Dict[str, Any], precomputed_regime: Optional[pd.Series] = 
                 sum(1 for t in trades if t.direction == "SHORT"))
     if regime_skip_count:
         logger.info("Regime skipped: %d entries (COMPRESSION)", regime_skip_count)
+    if regime_session_skip_count:
+        logger.info("Regime-session filtered: %d entries", regime_session_skip_count)
     if news_block_count:
         logger.info("NewsGate blocked: %d entries", news_block_count)
 

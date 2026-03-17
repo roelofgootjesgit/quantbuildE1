@@ -51,21 +51,17 @@ def make_baseline(base_cfg: dict) -> dict:
     return _backtest_risk_overrides(cfg, max_tps=3)
 
 
-def make_regime_full(base_cfg: dict) -> dict:
-    """REGIME_FULL: Skip COMPRESSION, EXPANSION gets 3:1 TP/SL."""
-    cfg = copy.deepcopy(base_cfg)
+def make_prod_v1(base_cfg: dict) -> dict:
+    """PROD_V1: SKIP_COMP, same 2:1 everywhere, no session filter per regime."""
+    cfg = load_config("configs/strict_prod_v1.yaml")
     cfg["backtest"]["default_period_days"] = PERIOD_DAYS
     return _backtest_risk_overrides(cfg, max_tps=3)
 
 
-def make_regime_skiponly(base_cfg: dict) -> dict:
-    """SKIP_COMP: Only skip COMPRESSION, keep EXPANSION same as TREND (2:1)."""
-    cfg = copy.deepcopy(base_cfg)
+def make_prod_v2(base_cfg: dict) -> dict:
+    """PROD_V2: SKIP_COMP + expansion only NY/Overlap after 10:00 UTC."""
+    cfg = load_config("configs/strict_prod_v2.yaml")
     cfg["backtest"]["default_period_days"] = PERIOD_DAYS
-    cfg.setdefault("regime_profiles", {})
-    cfg["regime_profiles"]["trend"] = {"tp_r": 2.0, "sl_r": 1.0}
-    cfg["regime_profiles"]["expansion"] = {"tp_r": 2.0, "sl_r": 1.0}
-    cfg["regime_profiles"]["compression"] = {"skip": True}
     return _backtest_risk_overrides(cfg, max_tps=3)
 
 
@@ -331,8 +327,8 @@ def main():
 
     variants = {
         "BASELINE": make_baseline(base_cfg),
-        "SKIP_COMP": make_regime_skiponly(base_cfg),
-        "REGIME_FULL": make_regime_full(base_cfg),
+        "PROD_V1": make_prod_v1(base_cfg),
+        "PROD_V2": make_prod_v2(base_cfg),
     }
 
     results = {}
